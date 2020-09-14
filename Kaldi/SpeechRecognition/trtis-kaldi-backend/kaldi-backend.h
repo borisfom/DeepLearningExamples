@@ -14,11 +14,14 @@
 
 #pragma once
 
-#define HAVE_CUDA 1  // Loading Kaldi headers with GPU
+#define HAVE_CUDA 0  // Loading Kaldi headers with GPU
 
 #include <cfloat>
 #include <sstream>
-#include "cudadecoder/batched-threaded-nnet3-cuda-online-pipeline.h"
+
+#include "online2/online-nnet3-decoding.h"
+#include "online2/online-nnet2-feature-pipeline.h"
+
 #include "fstext/fstext-lib.h"
 #include "lat/lattice-functions.h"
 #include "nnet3/am-nnet-simple.h"
@@ -28,6 +31,7 @@
 #include "src/core/model_config.h"
 #include "src/core/model_config.pb.h"
 #include "src/custom/sdk/custom_instance.h"
+#include <unordered_map>
 
 using kaldi::BaseFloat;
 
@@ -35,6 +39,21 @@ namespace nvidia {
 namespace inferenceserver {
 namespace custom {
 namespace kaldi_cbe {
+
+class Context;
+
+class ASRPipeline {
+ public:
+  kaldi::OnlineNnet2FeaturePipelineInfo pipeline_info_;
+  kaldi::OnlineNnet2FeaturePipeline feature_pipeline_; 
+  kaldi::nnet3::DecodableNnetSimpleLoopedInfo decodable_info_;
+  kaldi::SingleUtteranceNnet3Decoder  decoder_;
+  int32_t frame_offset;
+
+  ASRPipeline(Context& ctx);
+};
+ 
+typedef std::unordered_map<CorrelationID, std::shared_ptr<ASRPipeline> > ASRDecoderMap; 
 
 // Context object. All state must be kept in this object.
 class Context {
@@ -50,6 +69,7 @@ class Context {
   // Perform custom execution on the payloads.
   int Execute(const uint32_t payload_cnt, CustomPayload* payloads,
               CustomGetNextInputFn_t input_fn, CustomGetOutputFn_t output_fn);
+  friend class ASRPipeline;
 
  private:
   // init kaldi pipeline
@@ -66,17 +86,13 @@ class Context {
                       CustomPayload payload);
 
   bool CheckPayloadError(const CustomPayload& payload);
-  int FlushBatch();
+  void ResetPipeline();
 
   // The name of this instance of the backend.
   const std::string instance_name_;
 
   // The model configuration.
   const ModelConfig model_config_;
-
-  // The GPU device ID to execute on or CUSTOM_NO_GPU_DEVICE if should
-  // execute on CPU.
-  const int gpu_device_;
 
   // Models paths
   std::string nnet3_rxfilename_, fst_rxfilename_;
@@ -86,24 +102,22 @@ class Context {
   int max_batch_size_;
   int num_channels_;
   int num_worker_threads_;
-  std::vector<CorrelationID> batch_corr_ids_;
-  std::vector<kaldi::SubVector<kaldi::BaseFloat>> batch_wave_samples_;
-  std::vector<bool> batch_is_last_chunk_;
 
   BaseFloat sample_freq_, seconds_per_chunk_;
   int chunk_num_bytes_, chunk_num_samps_;
 
-  // feature_config includes configuration for the iVector adaptation,
-  // as well as the basic features.
-  kaldi::cuda_decoder::BatchedThreadedNnet3CudaOnlinePipelineConfig
-      batched_decoder_config_;
-  std::unique_ptr<kaldi::cuda_decoder::BatchedThreadedNnet3CudaOnlinePipeline>
-      cuda_pipeline_;
+  kaldi::OnlineNnet2FeaturePipelineConfig feature_opts;
+  kaldi::nnet3::NnetSimpleLoopedComputationOptions compute_opts;
+  kaldi::LatticeFasterDecoderConfig decoder_opts;
+  std::unique_ptr<fst::Fst<fst::StdArc>> decode_fst_;
+
   // Maintain the state of some shared objects
   kaldi::TransitionModel trans_model_;
 
   kaldi::nnet3::AmNnetSimple am_nnet_;
   fst::SymbolTable* word_syms_;
+
+  ASRDecoderMap pipeline_;
 
   const uint64_t int32_byte_size_;
   const uint64_t int64_byte_size_;
@@ -111,6 +125,7 @@ class Context {
 
   std::vector<uint8_t> byte_buffer_;
   std::vector<std::vector<uint8_t>> wave_byte_buffers_;
+
 };
 
 }  // kaldi

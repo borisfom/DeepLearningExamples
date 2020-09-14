@@ -1,7 +1,7 @@
 name: "kaldi_online"
 platform: "custom"
 default_model_filename: "libkaldi-trtisbackend.so"
-max_batch_size: 2200
+max_batch_size: 64
 parameters: {
 key: "mfcc_filename"
 value: { 
@@ -46,7 +46,7 @@ string_value:"40"
 {
 key: "max_execution_batch_size"
 value: { 
-string_value:"512"
+string_value:"64"
 }
 }]
 parameters: {
@@ -114,8 +114,8 @@ max_sequence_idle_microseconds:5000000
     }
   ]
 oldest {
-max_candidate_sequences:2200
-preferred_batch_size:[256,512]
+max_candidate_sequences:64
+preferred_batch_size:[8,16,64]
 max_queue_delay_microseconds:1000
 }
 },
@@ -141,8 +141,8 @@ output [
 ]
 instance_group [
   {
-    count: 2
-    kind: KIND_GPU
+    count: 1
+    kind: KIND_CPU
   }
 ]
 

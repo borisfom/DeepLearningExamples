@@ -15,6 +15,21 @@
 #include "kaldi-backend.h"
 #include "kaldi-backend-utils.h"
 
+#include "feat/wave-reader.h"
+#include "online2/onlinebin-util.h"
+#include "online2/online-timing.h"
+
+#include "fstext/fstext-lib.h"
+#include "lat/lattice-functions.h"
+#include "util/kaldi-thread.h"
+#include "nnet3/nnet-utils.h"
+#include <iostream>
+#include <cstdlib>
+
+using std::cerr;
+
+using namespace kaldi;
+
 namespace nvidia {
 namespace inferenceserver {
 namespace custom {
@@ -24,7 +39,6 @@ Context::Context(const std::string& instance_name,
                  const ModelConfig& model_config, const int gpu_device)
     : instance_name_(instance_name),
       model_config_(model_config),
-      gpu_device_(gpu_device),
       num_channels_(
           model_config_
               .max_batch_size()),  // diff in def between kaldi and trtis
@@ -40,12 +54,14 @@ int Context::ReadModelParameters() {
   int frame_subsampling_factor;
   float acoustic_scale;
   int num_worker_threads;
+
+  
   int err =
       ReadParameter(model_config_, "mfcc_filename",
-                    &batched_decoder_config_.feature_opts.mfcc_config) ||
+                    &feature_opts.mfcc_config) ||
       ReadParameter(
           model_config_, "ivector_filename",
-          &batched_decoder_config_.feature_opts.ivector_extraction_config) ||
+          &feature_opts.ivector_extraction_config) ||
       ReadParameter(model_config_, "beam", &beam) ||
       ReadParameter(model_config_, "lattice_beam", &lattice_beam) ||
       ReadParameter(model_config_, "max_active", &max_active) ||
@@ -59,6 +75,7 @@ int Context::ReadModelParameters() {
       ReadParameter(model_config_, "num_worker_threads", &num_worker_threads) ||
       ReadParameter(model_config_, "max_execution_batch_size",
                     &max_batch_size_);
+  
   if (err) return err;
   max_batch_size_ = std::max<int>(max_batch_size_, 1);
   num_channels_ = std::max<int>(num_channels_, 1);
@@ -69,24 +86,19 @@ int Context::ReadModelParameters() {
   if (max_active <= 0) return kInvalidModelConfig;
   if (acoustic_scale <= 0) return kInvalidModelConfig;
   if (num_worker_threads <= 0) return kInvalidModelConfig;
-  if (num_channels_ <= max_batch_size_) return kInvalidModelConfig;
+  if (num_channels_ < max_batch_size_) return kInvalidModelConfig;
 
-  batched_decoder_config_.compute_opts.frame_subsampling_factor =
-      frame_subsampling_factor;
-  batched_decoder_config_.compute_opts.acoustic_scale = acoustic_scale;
-  batched_decoder_config_.decoder_opts.default_beam = beam;
-  batched_decoder_config_.decoder_opts.lattice_beam = lattice_beam;
-  batched_decoder_config_.decoder_opts.max_active = max_active;
-  batched_decoder_config_.num_worker_threads = num_worker_threads;
-  batched_decoder_config_.max_batch_size = max_batch_size_;
-  batched_decoder_config_.num_channels = num_channels_;
+  compute_opts.frame_subsampling_factor = frame_subsampling_factor;
+  compute_opts.acoustic_scale = acoustic_scale;
+  decoder_opts.beam = beam;
+  decoder_opts.lattice_beam = lattice_beam;
+  decoder_opts.max_active = max_active;
 
-  auto feature_config = batched_decoder_config_.feature_opts;
-  kaldi::OnlineNnet2FeaturePipelineInfo feature_info(feature_config);
+  kaldi::OnlineNnet2FeaturePipelineInfo feature_info(feature_opts);
   sample_freq_ = feature_info.mfcc_opts.frame_opts.samp_freq;
   BaseFloat frame_shift = feature_info.FrameShiftInSeconds();
   seconds_per_chunk_ = chunk_num_samps_ / sample_freq_;
-
+  
   int samp_per_frame = static_cast<int>(sample_freq_ * frame_shift);
   float n_input_framesf = chunk_num_samps_ / samp_per_frame;
   bool is_integer = (n_input_framesf == std::floor(n_input_framesf));
@@ -96,21 +108,14 @@ int Context::ReadModelParameters() {
     return kInvalidModelConfig;
   }
   int n_input_frames = static_cast<int>(std::floor(n_input_framesf));
-  batched_decoder_config_.compute_opts.frames_per_chunk = n_input_frames;
+  compute_opts.frames_per_chunk = n_input_frames;
 
   return kSuccess;
 }
 
 int Context::InitializeKaldiPipeline() {
-  batch_corr_ids_.reserve(max_batch_size_);
-  batch_wave_samples_.reserve(max_batch_size_);
-  batch_is_last_chunk_.reserve(max_batch_size_);
   wave_byte_buffers_.resize(max_batch_size_);
   output_shape_ = {1, 1};
-  kaldi::CuDevice::Instantiate()
-      .SelectAndInitializeGpuIdWithExistingCudaContext(gpu_device_);
-  kaldi::CuDevice::Instantiate().AllowMultithreading();
-
   // Loading models
   {
     bool binary;
@@ -123,11 +128,8 @@ int Context::InitializeKaldiPipeline() {
     kaldi::nnet3::CollapseModel(kaldi::nnet3::CollapseModelConfig(),
                                 &(am_nnet_.GetNnet()));
   }
-  fst::Fst<fst::StdArc>* decode_fst = fst::ReadFstKaldiGeneric(fst_rxfilename_);
-  cuda_pipeline_.reset(
-      new kaldi::cuda_decoder::BatchedThreadedNnet3CudaOnlinePipeline(
-          batched_decoder_config_, *decode_fst, am_nnet_, trans_model_));
-  delete decode_fst;
+
+  decode_fst_.reset(fst::ReadFstKaldiGeneric(fst_rxfilename_));
 
   // Loading word syms for text output
   if (word_syms_rxfilename_ != "") {
@@ -137,9 +139,22 @@ int Context::InitializeKaldiPipeline() {
       return kInvalidModelConfig;
     }
   }
-  chunk_num_samps_ = cuda_pipeline_->GetNSampsPerChunk();
-  chunk_num_bytes_ = chunk_num_samps_ * sizeof(BaseFloat);
+
+//  fprintf(stderr, "Context::InitializeKaldiPipeline: sample_freq_ = %f, seconds_per_chunk_ = %f, n_input_framesf = %f\n",
+//	  sample_freq_, seconds_per_chunk_, n_input_framesf);
   return kSuccess;
+}
+
+ASRPipeline::ASRPipeline(Context& ctx):
+  pipeline_info_(ctx.feature_opts), 
+  feature_pipeline_(pipeline_info_),
+  decodable_info_(ctx.compute_opts, &ctx.am_nnet_),
+  decoder_(ctx.decoder_opts, ctx.trans_model_,
+	   decodable_info_,
+	   *ctx.decode_fst_, &feature_pipeline_)
+{
+  frame_offset = 0;
+  decoder_.InitDecoding(frame_offset);            
 }
 
 int Context::Init() {
@@ -156,15 +171,14 @@ bool Context::CheckPayloadError(const CustomPayload& payload) {
 int Context::Execute(const uint32_t payload_cnt, CustomPayload* payloads,
                      CustomGetNextInputFn_t input_fn,
                      CustomGetOutputFn_t output_fn) {
-  // kaldi::Timer timer;
+
   if (payload_cnt > num_channels_) return kBatchTooBig;
   // Each payload is a chunk for one sequence
   // Currently using dynamic batcher, not sequence batcher
-  for (uint32_t pidx = 0; pidx < payload_cnt; ++pidx) {
-    if (batch_corr_ids_.size() == max_batch_size_) FlushBatch();
+  for (uint32_t pidx = 0; pidx < payload_cnt ; ++pidx) {
 
     CustomPayload& payload = payloads[pidx];
-    if (payload.batch_size != 1) payload.error_code = kTimesteps;
+
     if (CheckPayloadError(payload)) continue;
 
     // Get input tensors
@@ -174,45 +188,45 @@ int Context::Execute(const uint32_t payload_cnt, CustomPayload* payloads,
     payload.error_code = GetSequenceInput(
         input_fn, payload.input_context, &corr_id, &start, &ready, &dim, &end,
         &wave_buffer, &wave_byte_buffers_[pidx]);
+    fprintf(stderr, "GetSequenceInput: corr_id=%ld, start=%d, ready=%d, dim=%d, end=%d\n", (long)corr_id, start, ready, dim, end);
     if (CheckPayloadError(payload)) continue;
     if (!ready) continue;
     if (dim > chunk_num_samps_) payload.error_code = kChunkTooBig;
     if (CheckPayloadError(payload)) continue;
+    
+    if (start) {
+      pipeline_[corr_id] = std::shared_ptr<ASRPipeline>(new ASRPipeline(*this));
+    }
+    
+    ASRPipeline& ch = *pipeline_[corr_id];
 
     kaldi::SubVector<BaseFloat> wave_part(wave_buffer, dim);
-    // Initialize corr_id if first chunk
-    if (start) cuda_pipeline_->InitCorrID(corr_id);
-    // Add to batch
-    batch_corr_ids_.push_back(corr_id);
-    batch_wave_samples_.push_back(wave_part);
-    batch_is_last_chunk_.push_back(end);
-
+    ch.feature_pipeline_.AcceptWaveform(sample_freq_, wave_part);
+    
     if (end) {
-      // If last chunk, set the callback for that seq
-      cuda_pipeline_->SetLatticeCallback(
-          corr_id, [this, &output_fn, &payloads, pidx,
-                    corr_id](kaldi::CompactLattice& clat) {
-            std::string output;
-            LatticeToString(*word_syms_, clat, &output);
-            SetOutputTensor(output, output_fn, payloads[pidx]);
-          });
+      cerr << "End of audio detected"<< "\n";
+      
+      ch.feature_pipeline_.InputFinished();
+
+      ch.decoder_.AdvanceDecoding();
+      ch.decoder_.FinalizeDecoding();
+
+      if (ch.decoder_.NumFramesDecoded() > 0) {
+	CompactLattice lat;
+	ch.decoder_.GetLattice(true, &lat);
+	std::string msg;
+	LatticeToString(*word_syms_, lat, &msg);
+	cerr << "EndOfAudio, sending message: " << msg << endl;
+	SetOutputTensor(msg, output_fn, payload);
+      }
+      pipeline_.erase(corr_id);
+      return kSuccess;
     }
   }
-  FlushBatch();
-  cuda_pipeline_->WaitForLatticeCallbacks();
+  // cerr << "Context::Execute end\n";
   return kSuccess;
 }
-
-int Context::FlushBatch() {
-  if (!batch_corr_ids_.empty()) {
-    cuda_pipeline_->DecodeBatch(batch_corr_ids_, batch_wave_samples_,
-                                batch_is_last_chunk_);
-    batch_corr_ids_.clear();
-    batch_wave_samples_.clear();
-    batch_is_last_chunk_.clear();
-  }
-}
-
+ 
 int Context::InputOutputSanityCheck() {
   if (!model_config_.has_sequence_batching()) {
     return kSequenceBatcher;
@@ -249,23 +263,13 @@ int Context::InputOutputSanityCheck() {
       (model_config_.input(1).data_type() != DataType::TYPE_INT32)) {
     return kInputOutputDataType;
   }
-  if ((model_config_.input(0).name() != "WAV_DATA") ||
-      (model_config_.input(1).name() != "WAV_DATA_DIM")) {
-    return kInputName;
-  }
 
-  if (model_config_.output_size() != 1) {
-    return kInputOutput;
-  }
   if ((model_config_.output(0).dims().size() != 1) ||
       (model_config_.output(0).dims(0) != 1)) {
     return kInputOutput;
   }
   if (model_config_.output(0).data_type() != DataType::TYPE_STRING) {
     return kInputOutputDataType;
-  }
-  if (model_config_.output(0).name() != "TEXT") {
-    return kOutputName;
   }
 
   return kSuccess;
@@ -342,6 +346,15 @@ int Context::SetOutputTensor(const std::string& output,
       buffer_as_int[0] = output.size();
       memcpy(&buffer_as_int[1], output.data(), output.size());
     }
+/*
+    const char* score_name = payload.required_output_names[1];
+    if (!output_fn(payload.output_context, score_name, sizeof(float),
+                   &output_shape_[0], byte_size_with_size_int, &obuffer)) {
+      payload.error_code = kOutputBuffer;
+      return payload.error_code;
+    }
+*/
+
   }
 }
 /////////////
