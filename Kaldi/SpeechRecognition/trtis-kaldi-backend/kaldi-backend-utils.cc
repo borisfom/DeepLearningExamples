@@ -61,26 +61,6 @@ int GetInputTensor(CustomGetNextInputFn_t input_fn, void* input_context,
   return kSuccess;
 }
 
-void LatticeToString(fst::SymbolTable& word_syms,
-                     const kaldi::CompactLattice& dlat, std::string* out_str) {
-  kaldi::CompactLattice best_path_clat;
-  kaldi::CompactLatticeShortestPath(dlat, &best_path_clat);
-
-  kaldi::Lattice best_path_lat;
-  fst::ConvertLattice(best_path_clat, &best_path_lat);
-
-  std::vector<int32> alignment;
-  std::vector<int32> words;
-  kaldi::LatticeWeight weight;
-  fst::GetLinearSymbolSequence(best_path_lat, &alignment, &words, &weight);
-  std::ostringstream oss;
-  for (size_t i = 0; i < words.size(); i++) {
-    std::string s = word_syms.Find(words[i]);
-    if (s == "") std::cerr << "Word-id " << words[i] << " not in symbol table.";
-    oss << s << " ";
-  }
-  *out_str = std::move(oss.str());
-}
 
 int ReadParameter(const ModelConfig& model_config_, const std::string& key,
                   std::string* param) {
